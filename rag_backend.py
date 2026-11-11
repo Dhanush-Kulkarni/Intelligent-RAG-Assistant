@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 
+import streamlit as st
 from dotenv import load_dotenv
 
 from langchain_community.document_loaders import PyPDFLoader
@@ -13,69 +14,31 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
-# Load environment variables
+
+# --------------------------------------------------
+# 1. LOAD ENVIRONMENT VARIABLES
+# --------------------------------------------------
+
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY not found. Check your .env file.")
+    try:
+        GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+    except Exception:
+        GROQ_API_KEY = None
 
-# HR policy PDF folder
-PDF_FOLDER = Path(__file__).parent
+if not GROQ_API_KEY:
+    raise ValueError(
+        "GROQ_API_KEY not found. Configure it in .env or Streamlit Secrets."
+    )
 
-# Load all PDF documents
-documents = []
 
-pdf_files = list(PDF_FOLDER.glob("*.pdf"))
+# --------------------------------------------------
+# 2. FORMAT RETRIEVED DOCUMENTS
+# --------------------------------------------------
 
-if not pdf_files:
-    raise FileNotFoundError("No HR policy PDFs found.")
-
-for pdf_file in pdf_files:
-    loader = PyPDFLoader(str(pdf_file))
-    documents.extend(loader.load())
-
-print(f"Loaded {len(pdf_files)} PDFs and {len(documents)} pages.")
-
-# Split documents into chunks
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1000,
-    chunk_overlap=200
-)
-
-chunks = text_splitter.split_documents(documents)
-
-print(f"Created {len(chunks)} document chunks.")
-
-# Generate embeddings
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
-
-# Create FAISS vector store
-vector_store = FAISS.from_documents(chunks, embeddings)
-
-print("FAISS vector store created successfully.")
-
-# Configure retriever
-retriever = vector_store.as_retriever(
-    search_type="mmr",
-    search_kwargs={
-        "k": 4,
-        "fetch_k": 20,
-        "lambda_mult": 0.9
-    }
-)
-
-# Configure Groq LLM
-llm = ChatGroq(
-    model="openai/gpt-oss-120b",
-    groq_api_key=GROQ_API_KEY,
-    temperature=0
-)
-
-# Format retrieved documents with source details
 def format_docs(docs):
     formatted_docs = []
 
@@ -90,12 +53,16 @@ Page: {page}
 Content:
 {doc.page_content}
 """
+
         formatted_docs.append(content)
 
     return "\n\n".join(formatted_docs)
 
 
-# HR chatbot prompt
+# --------------------------------------------------
+# 3. HR SYSTEM PROMPT
+# --------------------------------------------------
+
 hr_prompt = ChatPromptTemplate.from_template("""
 You are an HR Policy Assistant for Zyro Dynamics.
 
@@ -117,18 +84,81 @@ Employee Question:
 Answer:
 """)
 
-# Build RAG chain
-rag_chain = (
-    {
-        "context": retriever | format_docs,
-        "question": RunnablePassthrough()
-    }
-    | hr_prompt
-    | llm
-    | StrOutputParser()
-)
 
-# Input validation and guardrails
+# --------------------------------------------------
+# 4. INITIALIZE RAG PIPELINE WITH CACHING
+# --------------------------------------------------
+
+@st.cache_resource(show_spinner="Loading HR documents and building the search index...")
+def initialize_rag():
+
+    PDF_FOLDER = Path(__file__).parent
+
+    documents = []
+
+    pdf_files = list(PDF_FOLDER.glob("*.pdf"))
+
+    if not pdf_files:
+        raise FileNotFoundError("No HR policy PDFs found.")
+
+    for pdf_file in pdf_files:
+        loader = PyPDFLoader(str(pdf_file))
+        documents.extend(loader.load())
+
+    print(f"Loaded {len(pdf_files)} PDFs and {len(documents)} pages.")
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200
+    )
+
+    chunks = text_splitter.split_documents(documents)
+
+    print(f"Created {len(chunks)} document chunks.")
+
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+
+    vector_store = FAISS.from_documents(chunks, embeddings)
+
+    print("FAISS vector store created successfully.")
+
+    retriever = vector_store.as_retriever(
+        search_type="mmr",
+        search_kwargs={
+            "k": 4,
+            "fetch_k": 20,
+            "lambda_mult": 0.9
+        }
+    )
+
+    llm = ChatGroq(
+        model="openai/gpt-oss-120b",
+        groq_api_key=GROQ_API_KEY,
+        temperature=0
+    )
+
+    rag_chain = (
+        {
+            "context": retriever | format_docs,
+            "question": RunnablePassthrough()
+        }
+        | hr_prompt
+        | llm
+        | StrOutputParser()
+    )
+
+    return vector_store, rag_chain
+
+
+vector_store, rag_chain = initialize_rag()
+
+
+# --------------------------------------------------
+# 5. CHAT FUNCTION WITH GUARDRAILS
+# --------------------------------------------------
+
 def chat_with_hr(question):
 
     if not question or not question.strip():
@@ -148,13 +178,15 @@ def chat_with_hr(question):
     if any(phrase in question.lower() for phrase in blocked_phrases):
         return "Your question contains an unsupported instruction."
 
-    # Similarity distance check
     relevant_docs = vector_store.similarity_search_with_score(
         question,
         k=1
     )
 
     if not relevant_docs or relevant_docs[0][1] > 1.6:
-        return "I could not find relevant information in the available HR policy documents."
+        return (
+            "I could not find relevant information "
+            "in the available HR policy documents."
+        )
 
     return rag_chain.invoke(question)
